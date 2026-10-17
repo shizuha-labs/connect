@@ -1,0 +1,13 @@
+# Shizuha MCP Server Dependencies
+# CON-282 (ledger PLAT-5166): floors pinned to the locked safe versions so a
+# loose-range resolver can never admit the vulnerable mins the scanner flags.
+# Production installs use `uv sync --frozen` from root uv.lock (pyjwt 2.13.0,
+# mcp 1.28.1, idna 3.18, python-multipart 0.0.32).
+mcp>=1.28.1,<2.0.0
+requests>=2.28.0
+PyJWT>=2.13.0
+# CON-282: explicit idna floor (scanner hit from loose range; uv.lock already 3.18).
+idna>=3.15
+# PLAT-4250: floor python-multipart above the vulnerable range (pulled transitively via mcp/starlette).
+# <=0.0.30 carry GHSA-59g5-xgcq-4qw3 + PYSEC-2026-1852/3037/3038/3040 (DoS/parsing); 0.0.31+ clear all (pip-audit clean at 0.0.32).
+python-multipart>=0.0.31

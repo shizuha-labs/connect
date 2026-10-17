@@ -1,0 +1,433 @@
+# ORIG-18: PR-gating test job — copy of deploy.yml's `test-gate`, on
+# pull_request so branch protection can require the context
+# `premerge / test-gate (pull_request)` before any merge (PLAT-4516).
+# Keep in sync with deploy.yml when its test job changes.
+name: premerge
+on:
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test-gate:
+    # CON deploy red streak: keep the main-branch gate off shared ubuntu-latest.
+    # Runs the FULL Django suite + migration graph and the frontend clean-install,
+    # lint, unit, and production build before merge. A red check BLOCKS merge;
+    # local pre-push hooks are only the fast first line of defence.
+    runs-on: deploy-lane
+    steps:
+      - name: Checkout for PLAT-4251 static CI supply-chain check
+        uses: actions/checkout@v4
+      - name: PLAT-4251 static CI supply-chain guard (no pipe-to-shell; helm checksum)
+        run: |
+          set -euo pipefail
+          bash .forgejo/scripts/check-no-curl-pipe-shell.sh
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run Django test suite + migration graph gate before deploy
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-test-gate-connect-${SHORT}"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-test-gate, service: connect, shizuha.io/orig-task: ORIG-21 }
+          spec:
+            backoffLimit: 0
+            # Keep the in-cluster workload inside the runner's 2400s wait.
+            # ttlSecondsAfterFinished only applies after completion; without an
+            # active deadline, a slow dependency fetch can outlive a red gate.
+            # Recent healthy deploy-lane runs have needed 24-28 minutes under
+            # contention, so leave enough headroom to report the real test
+            # result instead of killing a still-progressing Job at 28m20s.
+            activeDeadlineSeconds: 2300
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/connect.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: test-gate
+                    image: python:3.12-bookworm
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        export DEBIAN_FRONTEND=noninteractive
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 install -y --no-install-recommends postgresql redis-server build-essential libpq-dev
+                        pg_ctlcluster "\$(ls /etc/postgresql | head -n1)" main start
+                        su postgres -c "psql -c \"ALTER USER postgres PASSWORD 'postgres';\""
+                        su postgres -c "createdb shizuha_connect_ci" || true
+                        redis-server --daemonize yes
+                        cd /workspace/src
+                        python -m pip install --index-url http://pip-cache.registry.svc.cluster.local/simple --trusted-host pip-cache.registry.svc.cluster.local --upgrade pip
+                        python -m pip install --index-url http://pip-cache.registry.svc.cluster.local/simple --trusted-host pip-cache.registry.svc.cluster.local uv==0.11.26
+                        # `uv sync --locked` follows files.pythonhosted.org URLs
+                        # embedded in uv.lock, bypassing the in-cluster cache. Export
+                        # the frozen, hash-pinned lock and sync it through the cache.
+                        UV_CACHE_DIR=/tmp/uv-cache uv lock --check
+                        uv export --frozen --no-dev --no-emit-project \
+                          --format requirements.txt --output-file /tmp/ci-requirements.txt
+                        uv venv --python python3 /workspace/src/.venv
+                        timeout -k 10 600 env UV_CACHE_DIR=/tmp/uv-cache UV_HTTP_TIMEOUT=60 UV_HTTP_RETRIES=10 UV_CONCURRENT_DOWNLOADS=4 \
+                          uv pip sync --python /workspace/src/.venv/bin/python --require-hashes \
+                          /tmp/ci-requirements.txt \
+                          --index-url http://pip-cache.registry.svc.cluster.local/simple \
+                          --allow-insecure-host pip-cache.registry.svc.cluster.local
+                        export PATH="/workspace/src/.venv/bin:$PATH"
+                        export POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=shizuha_connect_ci
+                        export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=shizuha_connect_ci
+                        export REDIS_URL=redis://127.0.0.1:6379/5 CACHE_REDIS_URL=redis://127.0.0.1:6379/6 REDIS_HOST=127.0.0.1 REDIS_PORT=6379 DEBUG=True SECRET_KEY=ci-secret MINIO_ACCESS_KEY=ci-storage MINIO_SECRET_KEY=ci-storage MINIO_ENDPOINT=http://127.0.0.1:9 JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret
+                        python manage.py makemigrations --check --dry-run
+                        python .forgejo/scripts/check-django-migration-graph.py
+                        # FULL test suite — the deploy gate itself, not advisory.
+                        # Single-threaded for reliability (no tblib/parallel-DB
+                        # edge cases); the whole suite runs in a few minutes,
+                        # well inside the kubectl wait timeout below. A single
+                        # failing test fails the Job and blocks build-and-deploy.
+                        # --keepdb: the pod is ephemeral, so keeping the test DB
+                        # has no downside AND skips the end-of-run DROP DATABASE,
+                        # which otherwise races lingering channels/async-ORM
+                        # connections ("database ... is being accessed by other
+                        # users") and fails the gate even when every test passed.
+                        python manage.py test --noinput --keepdb --verbosity=1
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=2400s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::Django test + migration gate failed (test failure or migration drift)"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=400 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::Django test + migration gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=400 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+      - name: Run frontend lock, lint, unit, and production-build gate before merge
+        run: |
+          set -euo pipefail
+          cd frontend
+          npm ci --registry=http://npm-cache.registry.svc.cluster.local:4873/
+          npm run lint
+          npm test
+          npm run build
+
+  # CON-269: frontend quality gate — the repo-local ESLint config + production
+  # build must stay green on every PR. Mirrors frontend/Dockerfile.ci exactly
+  # (self-contained standalone-repo build: @shizuha/ui resolved from the
+  # in-cluster npm-cache via the canonical @shizuha/ui/vite boundary) so a
+  # lint/build regression cannot silently reach main.
+  frontend-gate:
+    runs-on: deploy-lane
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run frontend lint + build gate
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-frontend-gate-connect-${SHORT}"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-frontend-gate, service: connect, shizuha.io/orig-task: CON-269 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 1700
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/connect.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: frontend-gate
+                    image: node:20-alpine
+                    workingDir: /workspace/src/frontend
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        # Same recipe as frontend/Dockerfile.ci: resolve @shizuha/ui
+                        # from the published package via the canonical @shizuha/ui/vite boundary.
+                        sed -i 's|"@shizuha/ui": "file:[^"]*"|"@shizuha/ui": "^1.2.6"|g' package.json
+                        npm ci --no-audit --no-fund
+                        npm run lint
+                        NODE_ENV=production npm run build
+                    env:
+                      - name: NPM_CONFIG_REGISTRY
+                        value: http://npm-cache.registry.svc.cluster.local:4873/
+                      - name: VITE_BASE_PATH
+                        value: /connect/
+                      - name: VITE_API_BASE
+                        value: /connect/api
+                      - name: VITE_HMR_DISABLE
+                        value: "true"
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=1800s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::frontend lint/build gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=400 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::frontend lint/build gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=400 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true
+
+
+  e2e-auth-gate:
+    runs-on: deploy-lane
+    needs: [test-gate, frontend-gate]
+    steps:
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Run auth e2e regression gate
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          JOB="ci-e2e-auth-connect-${SHORT}"
+          kubectl delete job -n build "${JOB}" --ignore-not-found
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-e2e-auth, service: connect, shizuha.io/orig-task: CON-271 }
+          spec:
+            backoffLimit: 0
+            activeDeadlineSeconds: 2300
+            ttlSecondsAfterFinished: 900
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector:
+                  kubernetes.io/hostname: s1
+                tolerations:
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                  - { key: node.shizuha/workstation, operator: Equal, value: "true", effect: NoSchedule }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/connect.git /workspace/src
+                        cd /workspace/src
+                        git fetch --depth=1 origin ${{ github.sha }}
+                        git checkout --detach ${{ github.sha }}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: e2e-auth
+                    image: mcr.microsoft.com/playwright:v1.58.1-noble
+                    command: ["/bin/bash","-lc"]
+                    args:
+                      - |
+                        set -euo pipefail
+                        export DEBIAN_FRONTEND=noninteractive
+                        # --- Start postgres + redis ---
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 update
+                        apt-get -o Acquire::http::Proxy=http://apt-cache.registry.svc.cluster.local:3142 install -y --no-install-recommends postgresql redis-server nginx python3-pip
+                        pg_ctlcluster "\$(ls /etc/postgresql | head -n1)" main start
+                        su postgres -c "psql -c \\"ALTER USER postgres PASSWORD 'postgres';\\""
+                        su postgres -c "createdb shizuha_connect_ci" || true
+                        su postgres -c "createdb shizuha_id_ci" || true
+                        redis-server --daemonize yes
+                        # --- Stub Admin membership projection (ID mint contract) ---
+                        # ID's login mint path passes required=True to the Admin
+                        # membership projection and fails closed with 503
+                        # (MembershipProjectionUnavailable, identity/views.py) when
+                        # Admin does not answer 200. The e2e pod does not run the
+                        # real Admin service; this stub answers the internal
+                        # contract so the gate can exercise refresh/fail-closed
+                        # auth behavior. Empty memberships is authoritative-accepted
+                        # for the CI user (PLAT-5334 path).
+                        python3 - <<'PY' &
+                        from http.server import BaseHTTPRequestHandler, HTTPServer
+                        class H(BaseHTTPRequestHandler):
+                            def do_GET(self):
+                                self.send_response(200)
+                                self.send_header('Content-Type', 'application/json')
+                                self.end_headers()
+                                self.wfile.write(b'{"memberships": {}}')
+                            def log_message(self, *a):
+                                pass
+                        HTTPServer(('127.0.0.1', 8003), H).serve_forever()
+                        PY
+                        ADMIN_STUB_PID=\$!
+                        export PIP_INDEX=http://pip-cache.registry.svc.cluster.local/simple
+                        # --- Provision ID (login/refresh backend + frontend) ---
+                        cd /workspace
+                        git clone --depth=1 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/id.git id-src
+                        cd id-src
+                        python3 -m pip install --break-system-packages --index-url \${PIP_INDEX} --trusted-host pip-cache.registry.svc.cluster.local uv==0.11.26
+                        uv sync --locked --no-dev --no-install-project
+                        export POSTGRES_HOST=127.0.0.1 POSTGRES_PORT=5432 POSTGRES_USER=postgres POSTGRES_PASSWORD=postgres POSTGRES_DB=shizuha_id_ci
+                        export DB_HOST=127.0.0.1 DB_PORT=5432 DB_USER=postgres DB_PASSWORD=postgres DB_NAME=shizuha_id_ci
+                        export REDIS_URL=redis://127.0.0.1:6379/1 SECRET_KEY=ci-secret MINIO_ACCESS_KEY=ci-storage MINIO_SECRET_KEY=ci-storage MINIO_ENDPOINT=http://127.0.0.1:9 JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret DEBUG=True
+                        export SHIZUHA_ADMIN_API_URL=http://127.0.0.1:8003/api
+                        export OAUTH_ISSUER_URL=http://127.0.0.1:8001
+                        .venv/bin/python manage.py migrate --noinput
+                        .venv/bin/python manage.py shell -c "from django.contrib.auth import get_user_model; U=get_user_model(); U.objects.filter(username='testuser').delete(); U.objects.create_user(username='testuser', email='testuser@example.com', password='TestPass123'); print('testuser created')"
+                        .venv/bin/python manage.py runserver 0.0.0.0:8001 &
+                        ID_PID=\$!
+                        # --- Build + serve ID frontend (login page at /id/login) ---
+                        cd /workspace/id-src/frontend
+                        sed -i 's|"@shizuha/ui": "file:[^"]*"|"@shizuha/ui": "^1.0.0"|g' package.json
+                        mkdir -p /packages/shizuha-ui
+                        echo 'ZXhwb3J0IGZ1bmN0aW9uIGNyZWF0ZVNoaXp1aGFDb25maWcoe3BvcnQsc2VydmljZU5hbWV9KXsKICBjb25zdCBiYXNlUGF0aD1wcm9jZXNzLmVudi5WSVRFX0JBU0VfUEFUSHx8Ii8iOwogIGNvbnN0IGFsbG93ZWRIb3N0cz1bImxvY2FsaG9zdCIsInNoaXp1aWEtIitzZXJ2aWNlTmFtZSsiLWZyb250ZW5kIiwibmdpbngiLAogICAgInNoaXp1aWEtbmdpbngiLCJzaGl6dWhhLW5naW54LWRldiIsIi5zaGl6dWhhLmNvbSIsCiAgICAic2hpenVoYS1zaGl6dWhhLSIrc2VydmljZU5hbWUrIi1mcm9udGVuZCIsIi5zdmMuY2x1c3Rlci5sb2NhbCJdOwogIHJldHVybiB7YmFzZTpiYXNlUGF0aCxvcHRpbWl6ZURlcHM6e2luY2x1ZGU6WyJsdWNpZGUtcmVhY3QiXX0sCiAgICBzZXJ2ZXI6e2hvc3Q6IjAuMC4wLjAiLHBvcnQsYWxsb3dlZEhvc3RzLAogICAgICBobXI6cHJvY2Vzcy5lbnYuVklURV9ITVJfRElTQUJMRT09PSJ0cnVlIj9mYWxzZTp0cnVlLAogICAgICB3YXRjaDp7dXNlUG9sbGluZzp0cnVlfX0sCiAgICBidWlsZDp7b3V0RGlyOiJkaXN0Iixzb3VyY2VtYXA6dHJ1ZX19Owp9CmV4cG9ydCBkZWZhdWx0IGNyZWF0ZVNoaXp1aGFDb25maWc7Cg==' | base64 -d > /packages/shizuha-ui/vite.shared.js
+                        npm ci --no-audit --no-fund --registry=http://npm-cache.registry.svc.cluster.local:4873/
+                        NODE_ENV=production VITE_BASE_PATH=/id/ npm run build
+                        npx serve -s dist -l 5174 &
+                        ID_FRONTEND_PID=\$!
+                        # --- Provision Connect backend ---
+                        cd /workspace/src
+                        python3 -m pip install --break-system-packages --index-url \${PIP_INDEX} --trusted-host pip-cache.registry.svc.cluster.local uv==0.11.26
+                        uv sync --locked --no-dev --no-install-project
+                        export POSTGRES_DB=shizuha_connect_ci DB_NAME=shizuha_connect_ci
+                        export REDIS_URL=redis://127.0.0.1:6379/5 CACHE_REDIS_URL=redis://127.0.0.1:6379/6 REDIS_HOST=127.0.0.1 REDIS_PORT=6379
+                        export DEBUG=True SECRET_KEY=ci-secret MINIO_ACCESS_KEY=ci-storage MINIO_SECRET_KEY=ci-storage MINIO_ENDPOINT=http://127.0.0.1:9 JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret
+                        export SHIZUHA_ID_API_URL=http://127.0.0.1:8001/api
+                        # RS256/JWKS verification (PLAT-675): Connect only accepts
+                        # ID's RS256 tokens; point the JWKS fetch + issuer check at
+                        # the in-pod ID backend (default shizuha-id:8001 does not
+                        # resolve here).
+                        export SHIZUHA_OAUTH_JWKS_URL=http://127.0.0.1:8001/.well-known/jwks.json
+                        export SHIZUHA_EXPECTED_ISSUER=http://127.0.0.1:8001
+                        .venv/bin/python manage.py migrate --noinput
+                        .venv/bin/python manage.py runserver 0.0.0.0:8000 &
+                        CONNECT_PID=\$!
+                        # --- Build + serve frontend ---
+                        cd /workspace/src/frontend
+                        sed -i 's|"@shizuha/ui": "file:[^"]*"|"@shizuha/ui": "^1.0.0"|g' package.json
+                        mkdir -p /packages/shizuha-ui
+                        echo 'ZXhwb3J0IGZ1bmN0aW9uIGNyZWF0ZVNoaXp1aGFDb25maWcoe3BvcnQsc2VydmljZU5hbWV9KXsKICBjb25zdCBiYXNlUGF0aD1wcm9jZXNzLmVudi5WSVRFX0JBU0VfUEFUSHx8Ii8iOwogIGNvbnN0IGFsbG93ZWRIb3N0cz1bImxvY2FsaG9zdCIsInNoaXp1aWEtIitzZXJ2aWNlTmFtZSsiLWZyb250ZW5kIiwibmdpbngiLAogICAgInNoaXp1aWEtbmdpbngiLCJzaGl6dWhhLW5naW54LWRldiIsIi5zaGl6dWhhLmNvbSIsCiAgICAic2hpenVoYS1zaGl6dWhhLSIrc2VydmljZU5hbWUrIi1mcm9udGVuZCIsIi5zdmMuY2x1c3Rlci5sb2NhbCJdOwogIHJldHVybiB7YmFzZTpiYXNlUGF0aCxvcHRpbWl6ZURlcHM6e2luY2x1ZGU6WyJsdWNpZGUtcmVhY3QiXX0sCiAgICBzZXJ2ZXI6e2hvc3Q6IjAuMC4wLjAiLHBvcnQsYWxsb3dlZEhvc3RzLAogICAgICBobXI6cHJvY2Vzcy5lbnYuVklURV9ITVJfRElTQUJMRT09PSJ0cnVlIj9mYWxzZTp0cnVlLAogICAgICB3YXRjaDp7dXNlUG9sbGluZzp0cnVlfX0sCiAgICBidWlsZDp7b3V0RGlyOiJkaXN0Iixzb3VyY2VtYXA6dHJ1ZX19Owp9CmV4cG9ydCBkZWZhdWx0IGNyZWF0ZVNoaXp1aGFDb25maWc7Cg==' | base64 -d > /packages/shizuha-ui/vite.shared.js
+                        npm ci --no-audit --no-fund --registry=http://npm-cache.registry.svc.cluster.local:4873/
+                        NODE_ENV=production VITE_BASE_PATH=/connect/ VITE_API_BASE=/connect/api npm run build
+                        npx serve -s dist -l 5173 &
+                        FRONTEND_PID=\$!
+                        # --- nginx routing: /connect/ -> frontend, /connect/api -> Connect, /id/ -> ID ---
+                        cat > /etc/nginx/sites-available/default <<'NGINX'
+                        server {
+                          listen 80;
+                          location /connect/api/ { proxy_pass http://127.0.0.1:8000/api/; proxy_set_header Host \$host; }
+                          location /connect/ { proxy_pass http://127.0.0.1:5173/; proxy_set_header Host \$host; }
+                          location /id/api/ { proxy_pass http://127.0.0.1:8001/api/; proxy_set_header Host \$host; }
+                          location /id/ { proxy_pass http://127.0.0.1:5174/; proxy_set_header Host \$host; }
+                          location / { return 302 /connect/; }
+                        }
+                        NGINX
+                        nginx -g "daemon off;" &
+                        NGINX_PID=\$!
+                        # --- Run the auth e2e spec against the local stack ---
+                        cd /workspace/src/frontend
+                        BASE_URL=http://127.0.0.1 npm run test:e2e -- --grep "silently refresh|fail closed"
+                        RC=\$?
+                        kill \${ID_PID} \${ID_FRONTEND_PID} \${CONNECT_PID} \${FRONTEND_PID} \${NGINX_PID} \${ADMIN_STUB_PID} 2>/dev/null || true
+                        exit \${RC}
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                      - name: NPM_CONFIG_REGISTRY
+                        value: http://npm-cache.registry.svc.cluster.local:4873/
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          kubectl wait -n build --for=condition=complete "job/${JOB}" --timeout=2400s &
+          WP=$!
+          while kill -0 "$WP" 2>/dev/null; do
+            if kubectl get -n build "job/${JOB}" -o jsonpath='{.status.failed}' 2>/dev/null | grep -q '[1-9]'; then
+              echo "::error::auth e2e regression gate failed"
+              kubectl logs -n build "job/${JOB}" --all-containers --tail=400 || true
+              kill "$WP" 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          wait "$WP" || {
+            echo "::error::auth e2e regression gate failed (timeout)"
+            kubectl logs -n build "job/${JOB}" --all-containers --tail=400 || true
+            exit 1
+          }
+          kubectl logs -n build "job/${JOB}" --all-containers --tail=120 || true

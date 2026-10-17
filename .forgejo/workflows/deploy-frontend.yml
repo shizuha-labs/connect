@@ -1,0 +1,335 @@
+# Shizuha Origin CI/CD — MULTI-ARCH build + deploy shizuha-connect-FRONTEND (PLAT-1058).
+# The frontend is a separate image from the backend (deploy.yml builds the backend).
+# Self-contained: @shizuha/ui is installed from the in-cluster npm-cache (Verdaccio),
+# NOT file:/packages/shizuha-ui, so this standalone-repo CI can build it.
+# Multi-arch (amd64 s1 + arm64 gx10) — frontend must run on any cluster node.
+name: deploy-shizuha-connect-frontend
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+    # Backend-only changes must not manufacture a frontend release revision.
+    # Besides wasting a two-architecture build, an unrelated frontend run used
+    # to race the backend Helm release and could finish green before Helm
+    # restored the previous frontend image.
+    paths:
+      - '.forgejo/workflows/deploy-frontend.yml'
+      - '.forgejo/scripts/**'
+      - '.dockerignore'
+      - 'frontend/**'
+concurrency:
+  group: deploy-shizuha-connect-frontend-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-and-deploy:
+    # deploy.yml's Helm release includes the frontend Deployment. Serialize the
+    # two live mutations so a late backend Helm apply cannot clobber a green
+    # frontend rollout with the tag it observed before this job completed.
+    concurrency:
+      group: deploy-connect-release-${{ github.ref }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact triggering revision for monotonic release guard
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install kubectl + cluster access
+        run: |
+          set -euo pipefail
+          KUBECTL_ARCH="$(uname -m)"; case "$KUBECTL_ARCH" in x86_64) KUBECTL_ARCH=amd64;; aarch64) KUBECTL_ARCH=arm64;; *) echo "Unsupported runner arch: $KUBECTL_ARCH" >&2; exit 1;; esac
+          curl -fsSL -o kubectl "http://forgejo-http.origin.svc.cluster.local/api/packages/actions/generic/kubectl/v1.34.1/kubectl-${KUBECTL_ARCH}"
+          install -m 0755 kubectl /usr/local/bin/kubectl
+          mkdir -p "$HOME/.kube"
+          printf '%s' "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Multi-arch build + deploy + verify (frontend)
+        run: |
+          set -euo pipefail
+          SHORT="$(echo "${{ github.sha }}" | cut -c1-7)"
+          FTAG="connect-frontend-${SHORT}"
+          REG="registry.registry.svc.cluster.local:5000"
+          echo "Multi-arch build shizuha-connect-frontend:${FTAG} (amd64 + arm64)"
+
+          render_build_job() {  # $1=arch
+            local ARCH="$1"
+            cat <<YAML
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-build-connect-frontend-${SHORT}-${ARCH}
+            namespace: build
+            labels: { app: ci-build, service: connect-frontend }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                nodeSelector: { kubernetes.io/arch: ${ARCH} }
+                tolerations:
+                  - { key: node.shizuha/workstation, operator: Exists, effect: NoSchedule }
+                  - { key: shizuha.com/inference-paused, operator: Exists, effect: NoSchedule }
+                  # amd64 kaniko on i9-ws times out pushing to registry ClusterIP;
+                  # s1 overlay works and carries operator=unschedulable. CI tolerates
+                  # the operator-hold taint instead of removing it.
+                  - { key: operator, operator: Equal, value: unschedulable, effect: NoSchedule }
+                affinity:
+                  nodeAffinity:
+                    requiredDuringSchedulingIgnoredDuringExecution:
+                      nodeSelectorTerms:
+                      - matchExpressions:
+                        - { key: node-role.kubernetes.io/control-plane, operator: DoesNotExist }
+                        # i9-ws overlay to ns registry is i/o timeout. Keep excluded until
+                        # ClusterIP/FORWARD on i9-ws is actually fixed.
+                        - { key: kubernetes.io/hostname, operator: NotIn, values: [i9-ws] }
+                initContainers:
+                  - name: git-clone
+                    image: alpine/git:2.43.0
+                    command: ["/bin/sh","-c"]
+                    args:
+                      - |
+                        set -e
+                        git clone --depth=50 http://x-token-auth:\${GIT_PASSWORD}@forgejo-http.origin.svc.cluster.local/shizuha-labs/connect.git /workspace/src
+                        cd /workspace/src && (git checkout ${{ github.sha }} 2>/dev/null || echo "sha not in shallow clone; building default HEAD")
+                    env:
+                      - name: GIT_PASSWORD
+                        valueFrom: { secretKeyRef: { name: forgejo-token, key: password } }
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                containers:
+                  - name: kaniko
+                    image: gcr.io/kaniko-project/executor:v1.23.2
+                    args:
+                      - --context=dir:///workspace/src
+                      - --dockerfile=/workspace/src/frontend/Dockerfile.ci
+                      - --destination=${REG}/shizuha-connect-frontend:${FTAG}-${ARCH}
+                      - --cleanup
+                      - --insecure
+                      - --skip-tls-verify
+                      - --insecure-pull
+                      - --registry-mirror=mirror-dockerhub.registry.svc.cluster.local:5000
+                      - --build-arg=NPM_CONFIG_REGISTRY=http://npm-cache.registry.svc.cluster.local:4873/
+                      - --build-arg=VITE_BASE_PATH=/connect/
+                      - --build-arg=VITE_API_BASE=/connect/api
+                      # kaniko LAYER cache (perf 2026-07-11): cache the npm-install
+                      # layer so only the source COPY + vite build rebuild.
+                      - --cache=true
+                      - --cache-repo=${REG}/kaniko-cache/connect-frontend-${ARCH}
+                      - --cache-copy-layers=true
+                      - --cache-ttl=336h
+                      - --compressed-caching=false
+                    volumeMounts: [{ mountPath: /workspace, name: workspace }]
+                volumes: [{ emptyDir: {}, name: workspace }]
+          YAML
+          }
+
+          BUILD_GUARD_CONFIGMAP="origin-ci-build-guard-650fec631781"
+          BUILD_GUARD_SHA256="650fec631781edce0e4980f0fb07b12ab78b67b1faf780b214d12a40f9dddcf6"
+          BUILD_GUARD="${RUNNER_TEMP:-/tmp}/origin-ci-build-guard.py"
+          kubectl get "configmap/${BUILD_GUARD_CONFIGMAP}" -n origin \
+            -o jsonpath='{.data.guard\.py}' >"$BUILD_GUARD"
+          echo "${BUILD_GUARD_SHA256}  ${BUILD_GUARD}" | sha256sum -c -
+          job_name_for_arch() {
+            local ARCH="$1"
+            render_build_job "$ARCH" | awk '$1 == "name:" { print $2; exit }'
+          }
+          AMD64_JOB="$(job_name_for_arch amd64)"
+          ARM64_JOB="$(job_name_for_arch arm64)"
+          test -n "$AMD64_JOB" -a -n "$ARM64_JOB"
+          cleanup_build_pair() {
+            python3 "$BUILD_GUARD" cleanup \
+              --namespace build --job "$AMD64_JOB" --job "$ARM64_JOB"
+          }
+          cleanup_on_failure() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then cleanup_build_pair || true; fi
+            exit "$rc"
+          }
+          trap cleanup_on_failure EXIT INT TERM
+          python3 "$BUILD_GUARD" preflight --arch amd64 --arch arm64
+          cleanup_build_pair
+          render_build_job amd64 | kubectl apply -f -
+          render_build_job arm64 | kubectl apply -f -
+          python3 "$BUILD_GUARD" wait-pair --namespace build \
+            --job "amd64=${AMD64_JOB}" --job "arm64=${ARM64_JOB}" \
+            --timeout-seconds 1800
+          trap - EXIT INT TERM
+
+          wait_job() {
+            local ARCH="$1"
+            local JOB="ci-build-connect-frontend-${SHORT}-${ARCH}"
+            # PLS-207/PLAT-1219 (PLAT-6970): `kubectl wait --for=condition=complete`
+            # NEVER returns on a FAILED job — when the job fails and is reaped
+            # (ttlSecondsAfterFinished), `kubectl get job` returns NotFound and the
+            # status.failed poll never fires, so the wait hangs for the full timeout.
+            # Poll for Complete OR Failed instead (shizuha-tasks#392 pattern).
+            local DEADLINE=$(( $(date +%s) + 1800 ))
+            while true; do
+              local COMPLETE FAILED
+              COMPLETE="$(kubectl get job -n build "${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+              FAILED="$(kubectl get job -n build "${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+              [ "${COMPLETE}" = "True" ] && break
+              if [ "${FAILED}" = "True" ]; then
+                echo "::error::kaniko frontend ${ARCH} build failed"
+                kubectl logs -n build "job/${JOB}" --all-containers --tail=80 || true
+                exit 1
+              fi
+              if [ "$(date +%s)" -ge "${DEADLINE}" ]; then
+                echo "::error::kaniko frontend ${ARCH} build timed out after 1800s"
+                kubectl logs -n build "job/${JOB}" --all-containers --tail=80 || true
+                exit 1
+              fi
+              sleep 5
+            done
+          }
+          wait_job amd64 &
+          WAIT_AMD64_PID=$!
+          wait_job arm64 &
+          WAIT_ARM64_PID=$!
+          WAIT_FAILED=0
+          wait "${WAIT_AMD64_PID}" || WAIT_FAILED=1
+          wait "${WAIT_ARM64_PID}" || WAIT_FAILED=1
+          if [ "${WAIT_FAILED}" -ne 0 ]; then
+            exit 1
+          fi
+
+          cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ci-manifest-connect-frontend-${SHORT}
+            namespace: build
+            labels: { app: ci-manifest, service: connect-frontend }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: crane
+                    image: gcr.io/go-containerregistry/crane:latest
+                    args:
+                      - index
+                      - append
+                      - --insecure
+                      - -t
+                      - ${REG}/shizuha-connect-frontend:${FTAG}
+                      - -m
+                      - ${REG}/shizuha-connect-frontend:${FTAG}-amd64
+                      - -m
+                      - ${REG}/shizuha-connect-frontend:${FTAG}-arm64
+          YAML
+          # PLS-207/PLAT-1219 (PLAT-6970): `kubectl wait --for=condition=complete`
+          # NEVER returns on a FAILED job — poll Complete OR Failed instead.
+          MANIFEST_DEADLINE=$(( $(date +%s) + 300 ))
+          while true; do
+            M_COMPLETE="$(kubectl get job -n build "ci-manifest-connect-frontend-${SHORT}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+            M_FAILED="$(kubectl get job -n build "ci-manifest-connect-frontend-${SHORT}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+            [ "${M_COMPLETE}" = "True" ] && break
+            if [ "${M_FAILED}" = "True" ] || [ "$(date +%s)" -ge "${MANIFEST_DEADLINE}" ]; then
+              echo "::error::frontend manifest combine failed or timed out"
+              kubectl logs -n build "job/ci-manifest-connect-frontend-${SHORT}" --tail=80 || true
+              exit 1
+            fi
+            sleep 5
+          done
+
+          verify_manifest() {
+            local REPO="$1"
+            local IMAGE_TAG="$2"
+            local JOB="ci-verify-${REPO}-${SHORT}"
+            cat <<YAML | kubectl apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: ${JOB}
+            namespace: build
+            labels: { app: ci-verify, service: ${REPO} }
+          spec:
+            backoffLimit: 0
+            ttlSecondsAfterFinished: 300
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: manifest-check
+                    image: python:3.12-alpine
+                    command: ["python", "-c"]
+                    args:
+                      - |
+                        import json, urllib.request
+                        url = "http://${REG}/v2/${REPO}/manifests/${IMAGE_TAG}"
+                        accept = ",".join([
+                            "application/vnd.oci.image.index.v1+json",
+                            "application/vnd.docker.distribution.manifest.list.v2+json",
+                        ])
+                        req = urllib.request.Request(url, headers={"Accept": accept})
+                        with urllib.request.urlopen(req, timeout=30) as resp:
+                            manifest = json.load(resp)
+                        platforms = {
+                            f"{m.get('platform', {}).get('os')}/{m.get('platform', {}).get('architecture')}"
+                            for m in manifest.get("manifests", [])
+                        }
+                        missing = {"linux/amd64", "linux/arm64"} - platforms
+                        print(f"{url} platforms={sorted(platforms)}")
+                        if missing:
+                            raise SystemExit(f"missing required platform(s): {sorted(missing)}")
+          YAML
+            # PLS-207/PLAT-1219 (PLAT-6970): `kubectl wait --for=condition=complete`
+            # NEVER returns on a FAILED job — poll Complete OR Failed instead.
+            VERIFY_DEADLINE=$(( $(date +%s) + 120 ))
+            while true; do
+              V_COMPLETE="$(kubectl get job -n build "${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)"
+              V_FAILED="$(kubectl get job -n build "${JOB}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)"
+              [ "${V_COMPLETE}" = "True" ] && break
+              if [ "${V_FAILED}" = "True" ] || [ "$(date +%s)" -ge "${VERIFY_DEADLINE}" ]; then
+                echo "::error::manifest verification failed or timed out"
+                kubectl logs -n build "job/${JOB}" --tail=80 || true
+                exit 1
+              fi
+              sleep 5
+            done
+            kubectl logs -n build "job/${JOB}" --tail=20 || true
+          }
+          verify_manifest "shizuha-connect-frontend" "${FTAG}"
+          set +e
+          .forgejo/scripts/monotonic-release-guard.sh shizuha shizuha-connect-frontend "${{ github.sha }}"
+          GUARD_RC="$?"
+          set -e
+          if [ "${GUARD_RC}" = 10 ]; then exit 0; fi
+          if [ "${GUARD_RC}" != 0 ]; then exit "${GUARD_RC}"; fi
+          PREV="$(kubectl get deploy -n shizuha shizuha-connect-frontend -o jsonpath='{.spec.template.spec.containers[?(@.name=="frontend")].image}' 2>/dev/null || true)"
+          if [ -n "${PREV}" ]; then
+            echo "Current image: ${PREV}"
+            echo "Rollback command: kubectl set image -n shizuha deploy/shizuha-connect-frontend frontend=${PREV} && kubectl rollout status -n shizuha deploy/shizuha-connect-frontend"
+          fi
+          # Re-assert loop: deploy.yml (same push, separate concurrency group)
+          # snapshots the LIVE frontend tag for its `helm upgrade
+          # --set frontend.image.tag=...` — if it snapshots BEFORE we roll and
+          # applies DURING our rollout, it reverts us to the previous tag
+          # (run 2603 @ b0d4f5b rolled back to bb6b410 mid-rollout). helm never
+          # re-touches the FE after its one apply, so re-asserting converges;
+          # only a persistent fighter still fails the run.
+          for attempt in 1 2 3; do
+            kubectl set image -n shizuha deploy/shizuha-connect-frontend frontend="localhost:30500/shizuha-connect-frontend:${FTAG}"
+            kubectl rollout status -n shizuha deploy/shizuha-connect-frontend --timeout=300s
+            LIVE="$(kubectl get deploy -n shizuha shizuha-connect-frontend -o jsonpath='{.spec.template.spec.containers[0].image}')"
+            echo "Live frontend image (attempt ${attempt}): ${LIVE}"
+            if echo "${LIVE}" | grep -q "${FTAG}"; then break; fi
+            if [ "${attempt}" = 3 ]; then echo "::error::frontend image mismatch after ${attempt} attempts"; exit 1; fi
+            echo "Frontend image clobbered mid-rollout (likely concurrent backend helm apply) — re-asserting"
+            sleep 10
+          done
+          kubectl annotate -n shizuha deploy/shizuha-connect-frontend shizuha.io/last-successful-sha="${{ github.sha }}" --overwrite
+          kubectl get pods -n shizuha -l app=shizuha-connect-frontend
+          # DeploymentEvent is post-rollout evidence, not part of the rollout
+          # transaction. Keep it fail-loud in the log without rewriting a
+          # converged deployment as failed when task correlation is missing.
+          if ! .forgejo/scripts/record-deployment-event.sh \
+            CON shizuha shizuha-connect-frontend frontend \
+            shizuha-connect-frontend \
+            "localhost:30500/shizuha-connect-frontend:${FTAG}" \
+            /connect/feed,/connect/messages; then
+            echo "::warning::frontend rollout succeeded but DeploymentEvent recording failed"
+          fi

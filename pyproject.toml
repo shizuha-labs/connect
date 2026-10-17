@@ -1,0 +1,49 @@
+[project]
+name = "shizuha-connect"
+version = "0.1.0"
+description = "Shizuha Connect messaging service"
+requires-python = ">=3.11"
+dependencies = [
+    # MAIL-188 (PLAT-7549): floor tightened to 4.2.30, the FINAL 4.2.x release —
+    # excludes all vulnerable 4.2.0–4.2.29. The 7 open OSV advisories at 4.2.30
+    # (GHSA-3h9f/8cjm/8qcx/923m/crhf/h7pc + PYSEC-2026-3717) are fixed only in
+    # 5.2.15+/6.0.x with no 4.2 backport (PLAT-5991/7008 disposition):
+    # defer-to-major, tracked on the connect findings ledger — a 5.x bump is a
+    # breaking-major change explicitly out of this batch's scope.
+    "Django>=4.2.30,<5.0",
+    # MAIL-188 (PLAT-7549): DRF floor at the patched 3.17.2 (CVE-2026-73228/73229).
+    "djangorestframework>=3.17.2",
+    "django-cors-headers>=4.0",
+    "django-filter>=23.0",
+    "djangorestframework-simplejwt>=5.3",
+    "PyJWT>=2.8",
+    "psycopg2-binary>=2.9",
+    "channels>=4.0",
+    "channels-redis>=4.1",
+    "daphne>=4.0",
+    "celery>=5.3",
+    "django-celery-beat>=2.5",
+    "redis>=5.0",
+    "drf-spectacular>=0.27",
+    "boto3>=1.34",
+    "django-storages>=1.14",
+    "django-postgres-extensions>=0.9",
+    "cryptography>=42.0",
+    "prometheus-client>=0.20",
+    "python-dateutil>=2.8",
+    "requests>=2.31",
+    "Pillow>=10.0",
+    "python-magic>=0.4",
+    "livekit-api>=1.0.0",
+    "gunicorn>=21.0",
+    "uvicorn>=0.25",
+    "whitenoise>=6.6",
+    "mcp>=2.0.0",
+    # PLAT-4250: floor python-multipart above the vulnerable range pulled via mcp.
+    # mcp itself permits >=0.0.9; all known advisories start at introduced:0.
+    "python-multipart>=0.0.31",
+    "ipython>=8.0",
+]
+
+[tool.uv]
+package = false
