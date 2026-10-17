@@ -1,0 +1,5 @@
+FROM localhost:30500/shizuha-connect:con78-202f53b-20260622-amd64
+WORKDIR /app
+COPY connect/ /app/connect/
+COPY mcp-server/ /app/mcp-server/
+RUN SECRET_KEY=build-static-only POSTGRES_PASSWORD=build-static-only MINIO_ACCESS_KEY=build-static-only MINIO_SECRET_KEY=build-static-only MINIO_ENDPOINT=http://127.0.0.1:9 python manage.py collectstatic --noinput

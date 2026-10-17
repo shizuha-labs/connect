@@ -1,0 +1,189 @@
+groups:
+  - name: connect-dm-delivery
+    rules:
+      - alert: ConnectDmReplayCapped
+        expr: rate(connect_dm_replay_capped_total[30m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: connect
+        annotations:
+          summary: Connect missed-DM replay candidate cap was hit
+          description: >-
+            UserChatConsumer reconnect replay hit the 200-message candidate cap.
+            Older undelivered DMs may not be replayed until the cap/window is
+            raised or the user pages history through the API.
+      - alert: ConnectSecurityAnomalyAlertFailures
+        expr: rate(connect_security_alert_failures_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: security
+        annotations:
+          summary: Connect security anomaly detector alert path is failing
+          description: >-
+            The Connect SIEM-lite anomaly detector queued/evaluated an event but
+            could not notify the configured security lead, or no alert recipient
+            was configured. Check connect_security_alert_failures_total labels and
+            repair CONNECT_SECURITY_ALERT_RECIPIENT_* or the System DM path.
+
+      - alert: ConnectSecurityAnomalyEventsNoAlerts
+        # Aggregate both sides and use empty-label vector matching so the
+        # outcome-labeled anomaly counter can be compared to the unlabeled sent
+        # counter; without this, PromQL returns an empty vector.
+        expr: >-
+          sum(increase(connect_security_events_evaluated_total{outcome="anomaly"}[30m])) > 0
+          and on() sum(increase(connect_security_alerts_sent_total[30m])) == 0
+        for: 10m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: security
+        annotations:
+          summary: Connect security anomalies evaluated but no alerts sent
+          description: >-
+            The Connect SIEM-lite worker evaluated anomaly events but no security
+            lead alert was sent in the same window. Check alert recipient
+            configuration and Connect System DM delivery.
+
+      - alert: ConnectTelemetryFamiliesAbsent
+        expr: >-
+          absent(connect_inbound_messages_total)
+          or absent(connect_message_persistence_failures_total)
+          or absent(connect_ws_fanout_lag_seconds_bucket)
+          or absent(connect_outbound_queue_depth)
+          or absent(connect_provider_events_total)
+        for: 10m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: One or more Connect delivery telemetry families are absent
+          description: >-
+            /metrics is missing at least one CON-163 telemetry family. This hides
+            Connect API/webhook delivery stalls, websocket fanout lag, provider
+            errors, or outbound backlog and violates the PLAT-1254 liveness
+            invariant.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectBridgeOutboundRetryingOld
+        expr: connect_bridge_outbound_retrying_oldest_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect outbound bridge retry backlog is aging
+          description: >-
+            CON-164 retrying outbound bridge events have exceeded the bounded
+            retry-age threshold. Check provider outage/rate-limit status and
+            BridgeOutboundEvent audit_metadata retry_after_seconds.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectBridgeOutboundDeadLettered
+        expr: connect_bridge_outbound_dead_lettered > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect outbound bridge messages dead-lettered
+          description: >-
+            One or more outbound bridge events reached the CON-164 terminal
+            dead_lettered state after exhausting retries. Inspect error_code and
+            audit_metadata.last_error_class before replaying or notifying users.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectMessagePersistenceFailures
+        expr: sum(rate(connect_message_persistence_failures_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect message persistence is failing
+          description: >-
+            DirectMessage or bridge message persistence failures are being
+            recorded. Users may see sent messages disappear before websocket or
+            provider fanout can run. Break down by provider/channel/error_class.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectWebsocketFanoutErrors
+        expr: sum(rate(connect_ws_fanout_total{result="failure"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect websocket fanout is failing
+          description: >-
+            Channel-layer fanout failures were observed. Users may need reconnect
+            replay to see messages, and connected-client delivery latency may be
+            degraded. Check connect_ws_fanout_total by path and ws-health.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectWebsocketFanoutLagHigh
+        expr: histogram_quantile(0.95, sum by (le, path) (rate(connect_ws_fanout_lag_seconds_bucket[10m]))) > 1
+        for: 10m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect websocket fanout latency is high
+          description: >-
+            The p95 synchronous channel-layer fanout call took more than one
+            second. Check Redis/channel-layer saturation before users see stale
+            chat delivery.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectOutboundQueueOldestPendingHigh
+        expr: max(connect_outbound_oldest_pending_age_seconds) > 600
+        for: 5m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect outbound bridge queue has old pending sends
+          description: >-
+            At least one outbound provider send has been pending for over ten
+            minutes. Use connect_outbound_queue_depth and
+            connect_outbound_oldest_pending_age_seconds by provider/channel;
+            this integrates with the PLAT-1278 stuck-outbound invariant.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectProviderErrors
+        expr: sum(rate(connect_provider_events_total{result=~"failure|failed|missing_secret|forbidden"}[10m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect provider/channel errors observed
+          description: >-
+            Provider auth, policy, send, or delivery errors are being recorded.
+            Break down connect_provider_events_total by provider/channel/event/result.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation
+
+      - alert: ConnectTelemetryCollectionErrors
+        expr: connect_outbound_queue_probe_errors > 0 or connect_invariant_probe_errors > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: connect
+          owner_group: engineering
+        annotations:
+          summary: Connect telemetry collection probe is failing
+          description: >-
+            A scrape-time Connect telemetry collector failed. This is fail-loud
+            liveness coverage for CON-163/PLAT-1254; inspect /metrics output and
+            app logs before trusting the dashboard.
+          runbook_url: https://s1.tail.shizuha.com/wiki/spaces/OPS/pages/alert-runbooks-index-all-prometheus-alerts-owner-remediation

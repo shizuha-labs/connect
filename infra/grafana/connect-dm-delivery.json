@@ -1,0 +1,80 @@
+{
+  "uid": "connect-dm-delivery",
+  "title": "Connect — DM delivery",
+  "tags": ["connect", "dm", "delivery"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Missed-DM replay fanout / sec by recipient role",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (user_role) (rate(connect_dm_replay_fanout_total[5m]))",
+          "legendFormat": "{{user_role}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Missed-DM replay per reconnect",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(connect_dm_replay_per_reconnect_count_bucket[5m])))",
+          "legendFormat": "p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(connect_dm_replay_per_reconnect_count_bucket[5m])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Replay cap hits / sec",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "rate(connect_dm_replay_capped_total[30m])",
+          "legendFormat": "cap hits",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1e-9}
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "Live DM delivery writes / sec by recipient role",
+      "type": "timeseries",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "sum by (user_role) (rate(connect_dm_live_delivery_total[5m]))",
+          "legendFormat": "{{user_role}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

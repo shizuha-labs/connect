@@ -1,0 +1,29 @@
+frontend/node_modules/
+test-results/
+playwright-report/
+*__pycache__/*
+*.pyc
+
+dump.rdb
+
+# Local environments, caches, and editor scratch (never commit)
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.claude/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/vite.dojo-proxy.config.js
+.venv/
+.pytest_cache/
+.venv-mcp/
+frontend/.vite-shim/
+
+# Authenticated UI captures belong in private evidence storage.
+docs/evidence/CON-278/*
+!docs/evidence/CON-278/a11y-notes.md

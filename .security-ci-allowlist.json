@@ -1,0 +1,27 @@
+{
+  "_comment": "security-ci suppressions for connect. PLAT-6700 / ledger PLAT-6369.",
+  "allowlist": [
+    {
+      "source_id": "security-ci:72f61c98032b46dfaf0202f3",
+      "tool": "semgrep",
+      "rule": "python.jwt.security.jwt-hardcode.jwt-python-hardcoded-secret",
+      "path_contains": "mcp-server/test_token_verifier.py",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Test-only literal 'secret' HS256 input in mcp-server/test_token_verifier.py:90 (test_hs256_shared_secret_token_is_rejected) \u2014 the test asserts the verifier REJECTS it; production verifies RS256 against Shizuha ID JWKS and never uses this value. Same FP class as CON-282's allowlisted line 28. Adjudicated PLAT-6700 2026-08-21.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    },
+    {
+      "source_id": "security-ci:5dcdfddcac0ddcd5ffd76993",
+      "tool": "semgrep",
+      "rule": "python.jwt.security.jwt-hardcode.jwt-python-hardcoded-secret",
+      "path_contains": "mcp-server/test_token_verifier.py",
+      "owner": "security@shizuha.com",
+      "disposition": "accepted-false-positive",
+      "reason": "Test-only literal 'secret' HS256 input in mcp-server/test_token_verifier.py:28 (test_hs256_shared_secret_token_is_rejected) \u2014 the test asserts the verifier REJECTS it; production verifies RS256 against Shizuha ID JWKS and never uses this value. CON-282 / ledger PLAT-5166.",
+      "approved_by": "security@shizuha.com",
+      "expires": "2099-12-31"
+    }
+  ]
+}
