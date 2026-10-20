@@ -730,7 +730,17 @@ jobs:
           # DeploymentEvent is post-rollout evidence, not part of the rollout
           # transaction. Keep it fail-loud in the log without rewriting a
           # converged deployment as failed when task correlation is missing.
-          if ! .forgejo/scripts/record-deployment-event.sh \
+          # CON-231 (2026-10-19): the deploy-lane runner has no forgejo-token
+          # secret — ns-origin read NotFound, build-ns unreadable by the
+          # runner SA — so the recorder's inline fallback chain always ended
+          # PR_NUMBER=0 and Pulse's authoritative ingest dropped the rollout
+          # evidence (observed on deploy-connect run 943 at 2026-10-17
+          # 13:20:12Z: "DeploymentEvent did not correlate to any linked
+          # Pulse task"). The runner already holds DEPLOY_PUSH_TOKEN (used
+          # for git push + Contents PUT) and the recorder accepts it as
+          # FORGEJO_TOKEN; pass it through. Degrades safely to PR_NUMBER=0
+          # if the token is empty, exactly as before.
+          if ! FORGEJO_TOKEN="${DEPLOY_PUSH_TOKEN_VALUE}" .forgejo/scripts/record-deployment-event.sh \
             CON shizuha shizuha-connect backend shizuha-connect \
             "localhost:30500/shizuha-connect:${TAG}" \
             /connect/feed,/connect/messages; then
