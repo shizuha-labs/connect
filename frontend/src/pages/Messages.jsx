@@ -281,10 +281,13 @@ function Messages() {
   }
 
   const onComposerKeyDown = (event) => {
-    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-      event.preventDefault()
-      submitMessage(event)
-    }
+    // CON-516: Enter must dispatch the REST send. Clearing the draft only
+    // happens in onSuccess, so a dropped send keeps the text. Shift+Enter
+    // inserts a newline. Ctrl/Cmd+Enter remains a send alias.
+    if (event.key !== 'Enter' || event.isComposing) return
+    if (event.shiftKey) return
+    event.preventDefault()
+    submitMessage(event)
   }
 
   const onComposerInput = (event) => {
@@ -609,7 +612,7 @@ function Messages() {
             data-testid="message-composer-form"
           >
             <label className="sr-only" htmlFor="message-composer">
-              Message. Press Control or Command and Enter to send.
+              Message. Press Enter to send. Shift+Enter inserts a newline.
             </label>
             <div className="flex items-end gap-2 min-w-0 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50/80 dark:bg-gray-950/40 p-2 shadow-sm focus-within:ring-2 focus-within:ring-primary-500/40">
               <textarea
@@ -644,7 +647,7 @@ function Messages() {
               </p>
             )}
             <p id="composer-hint" className="mt-1.5 text-[11px] text-gray-400 dark:text-gray-500">
-              ⌘/Ctrl + Enter to send
+              Enter to send · Shift+Enter for a new line
             </p>
           </form>
         </>
