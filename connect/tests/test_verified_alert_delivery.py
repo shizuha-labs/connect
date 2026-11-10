@@ -35,8 +35,14 @@ class VerifiedAlertDeliveryTests(TestCase):
             first = InternalVerifiedAlertDeliveryView.as_view()(self.request())
             self.assertEqual(broadcast.call_count, 0)
         self.assertEqual(first.status_code, 201)
-        self.assertEqual(len(callbacks), 1)
-        callbacks[0]()
+        # Two ConversationParticipant creates each register a profile ensure.
+        # The third callback is the alert broadcast.
+        self.assertEqual(len(callbacks), 3)
+        for callback in callbacks:
+            names = getattr(getattr(callback, '__code__', None), 'co_names', ())
+            if 'enqueue_participant_profile' in names:
+                continue
+            callback()
         self.assertEqual(broadcast.call_count, 1)
         second = InternalVerifiedAlertDeliveryView.as_view()(self.request())
         self.assertEqual(second.status_code, 200)
