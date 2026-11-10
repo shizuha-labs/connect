@@ -7,7 +7,7 @@ Handles automatic updates when models change.
 from django.db.models.signals import post_save, post_delete
 from django.dispatch import receiver
 from django.contrib.postgres.search import SearchVector
-from django.db import IntegrityError, connection, models
+from django.db import IntegrityError, connection, models, transaction
 from django.utils import timezone
 import logging
 import re
@@ -335,11 +335,20 @@ def ensure_participant_social_profile_signal(sender, instance, created, **kwargs
     """
     if not created:
         return
+    # PLAT-10179: post_save runs before the enclosing transaction commits.
+    # Enqueue only after durable commit so a rolled-back fixture cannot leak
+    # a Celery task for a participant row that will not exist.
+    user_id = getattr(instance, 'user_id', None)
+    transaction.on_commit(lambda uid=user_id: enqueue_participant_profile(uid))
+
+
+def enqueue_participant_profile(user_id):
+    """Celery enqueue for CON-52. Called only from transaction.on_commit."""
     try:
         from connect.tasks import ensure_participant_social_profile
-        ensure_participant_social_profile.delay(instance.user_id)
+        ensure_participant_social_profile.delay(user_id)
     except Exception:
         logger.warning(
             "CON-52: failed to enqueue profile ensure for user %s",
-            getattr(instance, 'user_id', '?'), exc_info=True,
+            user_id, exc_info=True,
         )
