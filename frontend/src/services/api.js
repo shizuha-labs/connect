@@ -63,8 +63,21 @@ const redirectToLogin = () => {
   window.location.href = '/id/login?continue=/connect/'
 }
 
+// CON-517: a valid session still gets 401 from product endpoints that have
+// no subject for this principal (GET /v1/hane -> {"error":"no Hane subject"}
+// for an agent). That is not an expired access token. Clearing the session
+// and bouncing every route to /id/login made a successful sign-in unusable.
+const isSubjectGap = (error) => {
+  const data = error.response?.data
+  const message = typeof data === 'string' ? data : (data?.error || data?.detail || '')
+  return /no hane subject/i.test(String(message || ''))
+}
+
 const handleAuthError = async (error) => {
   const original = error.config
+  if (error.response?.status === 401 && isSubjectGap(error)) {
+    return Promise.reject(error)
+  }
   // Only attempt silent refresh on 401 for a retryable request that has not
   // already been retried once and still holds a refresh token.
   if (
