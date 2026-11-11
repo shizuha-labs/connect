@@ -13,22 +13,47 @@ export function AuthProvider({ children }) {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
 
   useEffect(() => {
-    // Check for existing auth token from Shizuha ID
-    const token = localStorage.getItem(ACCESS_TOKEN_KEY)
-    const userData = localStorage.getItem(USER_KEY)
+    const initAuth = async () => {
+      let token = localStorage.getItem(ACCESS_TOKEN_KEY)
+      let userData = localStorage.getItem(USER_KEY)
 
-    if (token && userData) {
-      try {
-        setUser(JSON.parse(userData))
-        setIsAuthenticated(true)
-      } catch (e) {
-        console.error('Failed to parse user data:', e)
-        localStorage.removeItem(ACCESS_TOKEN_KEY)
-        localStorage.removeItem(REFRESH_TOKEN_KEY)
-        localStorage.removeItem(USER_KEY)
+      if (!(token && userData)) {
+        // ID-93: bootstrap from the HttpOnly Shizuha-ID session cookies.
+        // localStorage alone leaves a fresh load (cleared site data, browser
+        // restart, non-page login) bouncing to /id/login despite valid
+        // cookies; this same-origin call lets the cookies seed the session.
+        try {
+          const response = await fetch('/id/api/auth/session-bootstrap/', {
+            credentials: 'include',
+          })
+          if (response.ok) {
+            const data = await response.json()
+            localStorage.setItem(ACCESS_TOKEN_KEY, data.tokens.access)
+            localStorage.setItem(REFRESH_TOKEN_KEY, data.tokens.refresh)
+            localStorage.setItem(USER_KEY, JSON.stringify(data.user))
+            token = data.tokens.access
+            userData = JSON.stringify(data.user)
+          }
+        } catch {
+          // No/invalid cookies — genuinely signed out.
+        }
       }
+
+      if (token && userData) {
+        try {
+          setUser(JSON.parse(userData))
+          setIsAuthenticated(true)
+        } catch (e) {
+          console.error('Failed to parse user data:', e)
+          localStorage.removeItem(ACCESS_TOKEN_KEY)
+          localStorage.removeItem(REFRESH_TOKEN_KEY)
+          localStorage.removeItem(USER_KEY)
+        }
+      }
+      setIsLoading(false)
     }
-    setIsLoading(false)
+
+    initAuth()
   }, [])
 
   const logout = () => {
