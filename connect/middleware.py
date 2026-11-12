@@ -1,6 +1,18 @@
+import logging
+import os
+
 from django.http import JsonResponse
 
 from connect.authentication import ShizuhaJWTAuthentication
+
+logger = logging.getLogger(__name__)
+
+# PLAT-12776: env-guarded credential-layer diagnostics. Default OFF — zero
+# behavior change when disabled; when enabled (SHIZUHA_SERVICE_ACCESS_DIAG=1),
+# logs the token-validation outcome, the enabled_services claim, and the
+# DENY/ALLOW verdict so the 403 origin (middleware vs DRF permission) is
+# named from logs alone.
+_DIAG = os.environ.get('SHIZUHA_SERVICE_ACCESS_DIAG') == '1'
 
 
 # Match both ingress mounts: /api/internal/... and /shizuha-connect/api/internal/...
@@ -58,17 +70,34 @@ class ServiceAccessMiddleware:
             token = auth_header[7:]
             try:
                 validated_token = ShizuhaJWTAuthentication().get_validated_token(token)
+                if _DIAG:
+                    logger.error(
+                        'PLAT-12776 diag token validated: claims keys=%s enabled_services=%r staff=%r path=%s',
+                        sorted(validated_token.keys()),
+                        validated_token.get('enabled_services'),
+                        validated_token.get('is_staff'),
+                        request.path,
+                    )
                 if validated_token.get('is_staff') or validated_token.get('is_superuser'):
                     return self.get_response(request)
                 enabled_services = validated_token.get('enabled_services')
                 if enabled_services is not None and self.SERVICE_SLUG not in enabled_services:
+                    if _DIAG:
+                        logger.error(
+                            'PLAT-12776 diag DENY by middleware: slug=%r not in %r path=%s',
+                            self.SERVICE_SLUG, enabled_services, request.path,
+                        )
                     return JsonResponse(
                         {'error': 'You do not have access to this service.',
                          'service': self.SERVICE_SLUG,
                          'code': 'service_access_denied'},
                         status=403
                     )
-            except Exception:
+                if _DIAG:
+                    logger.error('PLAT-12776 diag middleware ALLOW: path=%s', request.path)
+            except Exception as exc:
+                if _DIAG:
+                    logger.error('PLAT-12776 diag token validation raised: %r path=%s', exc, request.path)
                 pass  # Let DRF authentication handle missing/invalid/expired tokens
 
         return self.get_response(request)

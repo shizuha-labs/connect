@@ -4,13 +4,14 @@ version = "0.1.0"
 description = "Shizuha Connect messaging service"
 requires-python = ">=3.11"
 dependencies = [
-    # MAIL-188 (PLAT-7549): floor tightened to 4.2.30, the FINAL 4.2.x release —
-    # excludes all vulnerable 4.2.0–4.2.29. The 7 open OSV advisories at 4.2.30
-    # (GHSA-3h9f/8cjm/8qcx/923m/crhf/h7pc + PYSEC-2026-3717) are fixed only in
-    # 5.2.15+/6.0.x with no 4.2 backport (PLAT-5991/7008 disposition):
-    # defer-to-major, tracked on the connect findings ledger — a 5.x bump is a
-    # breaking-major change explicitly out of this batch's scope.
-    "Django>=4.2.30,<5.0",
+    # PLAT-12776 (closes the PLAT-12655 CVE-2026-15307 risk-acceptance): django
+    # 5.2.17 LTS — the only LTS-track fix for GHSA-wvqv-fj8w-qmhm (RCE via
+    # GeoDjango spatial lookups; path unreachable in connect — no
+    # django.contrib.gis, verified 2026-10-28). Controlled major upgrade:
+    # dependency matrix verified at locked versions (DRF 3.17.2, simplejwt
+    # 5.5.1, celery-beat 2.9.0, filter 25.1, storages 1.14.6, channels 4.3.2,
+    # cors-headers 4.9.0, spectacular 0.29.0 — no django<5.0 caps).
+    "Django>=5.2.17,<6.0",
     # MAIL-188 (PLAT-7549): DRF floor at the patched 3.17.2 (CVE-2026-73228/73229).
     "djangorestframework>=3.17.2",
     "django-cors-headers>=4.0",

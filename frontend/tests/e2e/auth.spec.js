@@ -188,6 +188,30 @@ test.describe('Authentication', () => {
         }
       })
 
+      // WIKI-120-class response-loss probe (PLAT-12776): the empty-apiResponses
+      // + backend-saw-the-request combo means the response may never have
+      // COMPLETED under django 5.2. Capture what the /connect/api/-only
+      // listener cannot see: failed requests (network-level), page console
+      // (net errors surface here), and page-level (non-API) responses.
+      const failedRequests = []
+      page.on('requestfailed', request => {
+        failedRequests.push(`${request.method()} ${request.url()} :: ${request.failure() ? request.failure().errorText : 'unknown'}`)
+      })
+      const consoleMessages = []
+      page.on('console', message => {
+        consoleMessages.push(`${message.type()}: ${message.text()}`)
+      })
+      const pageErrors = []
+      page.on('pageerror', error => {
+        pageErrors.push(String(error))
+      })
+      const pageLevelResponses = []
+      page.on('response', response => {
+        if (!response.url().includes('/connect/api/')) {
+          pageLevelResponses.push(`${response.status()} ${response.url()}`)
+        }
+      })
+
       // Reload /connect/ with the expired access token.
       await page.goto('/connect/')
       await page.waitForLoadState('networkidle', { timeout: 20000 })
@@ -198,6 +222,10 @@ test.describe('Authentication', () => {
       console.log('CON-271 diag [silent-refresh] url:', page.url())
       console.log('CON-271 diag [silent-refresh] access token:', await page.evaluate(() => localStorage.getItem('shizuha_access_token')))
       console.log('CON-271 diag [silent-refresh] refresh token present:', await page.evaluate(() => !!localStorage.getItem('shizuha_refresh_token')))
+      console.log('CON-271 diag [silent-refresh] requestfailed:', JSON.stringify(failedRequests))
+      console.log('CON-271 diag [silent-refresh] console:', JSON.stringify(consoleMessages))
+      console.log('CON-271 diag [silent-refresh] pageerror:', JSON.stringify(pageErrors))
+      console.log('CON-271 diag [silent-refresh] pageLevelResponses:', JSON.stringify(pageLevelResponses))
 
       // Must NOT be redirected to the ID login page.
       await expect(page).not.toHaveURL(/.*\/id\/login.*/, { timeout: 15000 })
