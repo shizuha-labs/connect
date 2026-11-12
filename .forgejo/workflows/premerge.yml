@@ -349,7 +349,11 @@ jobs:
                         export SHIZUHA_ADMIN_API_URL=http://127.0.0.1:8003/api
                         export OAUTH_ISSUER_URL=http://127.0.0.1:8001
                         .venv/bin/python manage.py migrate --noinput
-                        .venv/bin/python manage.py shell -c "from django.contrib.auth import get_user_model; U=get_user_model(); U.objects.filter(username='testuser').delete(); U.objects.create_user(username='testuser', email='testuser@example.com', password='TestPass123'); print('testuser created')"
+                        # PLAT-12776: seed the CI user with the connect service grant
+                        # (base64-script pattern; diag run 1070 showed the refresh-minted
+                        # claim was [id,hive,mail] and the middleware correctly DENYed).
+                        echo 'ZnJvbSBkamFuZ28uY29udHJpYi5hdXRoIGltcG9ydCBnZXRfdXNlcl9tb2RlbApVID0gZ2V0X3VzZXJfbW9kZWwoKQpVLm9iamVjdHMuZmlsdGVyKHVzZXJuYW1lPSd0ZXN0dXNlcicpLmRlbGV0ZSgpCnUgPSBVLm9iamVjdHMuY3JlYXRlX3VzZXIodXNlcm5hbWU9J3Rlc3R1c2VyJywgZW1haWw9J3Rlc3R1c2VyQGV4YW1wbGUuY29tJywgcGFzc3dvcmQ9J1Rlc3RQYXNzMTIzJykKIyBQTEFULTEyNzc2IHYzOiBVc2VyUHJvZmlsZS5lbmFibGVkX3Rvb2xzIGlzIGFuIE0yTSB0byBUb29sKHNsdWcpIOKAlCBncmFudAojIHZpYSAuYWRkKCkgKGRpYWcgcnVuIDEwNzA6IGNsYWltIFtpZCxoaXZlLG1haWxdOyBydW4gMTA3MSBzaG93ZWQgdGhlCiMgbWFuYWdlciBzaGFwZTsgdjIncyBsaXN0LWFzc2lnbm1lbnQgcmFpc2VkKS4KdG9vbHMgPSBOb25lCnAgPSBnZXRhdHRyKHUsICdwcm9maWxlJywgTm9uZSkKaWYgcCBpcyBub3QgTm9uZSBhbmQgaGFzYXR0cihwLCAnZW5hYmxlZF90b29scycpOgogICAgdHJ5OgogICAgICAgIGZyb20gaWRlbnRpdHkubW9kZWxzIGltcG9ydCBUb29sCiAgICAgICAgdG9vbCwgXyA9IFRvb2wub2JqZWN0cy5nZXRfb3JfY3JlYXRlKHNsdWc9J2Nvbm5lY3QnKQogICAgICAgIHAuZW5hYmxlZF90b29scy5hZGQodG9vbCkKICAgICAgICB0b29scyA9IHNvcnRlZCh0LnNsdWcgZm9yIHQgaW4gcC5lbmFibGVkX3Rvb2xzLmFsbCgpKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHByaW50KCdQTEFULTEyNzc2IHYzIGdyYW50IGZhaWxlZDonLCB0eXBlKGUpLl9fbmFtZV9fLCBlKQplbHNlOgogICAgcHJpbnQoJ1BMQVQtMTI3NzYgdjM6IG5vIHVzZXIucHJvZmlsZSB3aXRoIGVuYWJsZWRfdG9vbHM7IHByb2ZpbGUgPScsIHJlcHIocCkpCnByaW50KCdQTEFULTEyNzc2IHYzIHNlZWQgb3V0Y29tZTogZW5hYmxlZCB0b29sczonLCB0b29scykK' | base64 -d > /workspace/seed_ci_user.py
+                        .venv/bin/python manage.py shell < /workspace/seed_ci_user.py
                         .venv/bin/python manage.py runserver 0.0.0.0:8001 &
                         ID_PID=\$!
                         # --- Build + serve ID frontend (login page at /id/login) ---
@@ -369,6 +373,9 @@ jobs:
                         export REDIS_URL=redis://127.0.0.1:6379/5 CACHE_REDIS_URL=redis://127.0.0.1:6379/6 REDIS_HOST=127.0.0.1 REDIS_PORT=6379
                         export DEBUG=True SECRET_KEY=ci-secret MINIO_ACCESS_KEY=ci-storage MINIO_SECRET_KEY=ci-storage MINIO_ENDPOINT=http://127.0.0.1:9 JWT_SECRET_KEY=ci-secret SHIZUHA_JWT_SIGNING_KEY=ci-secret
                         export SHIZUHA_ID_API_URL=http://127.0.0.1:8001/api
+                        # PLAT-12776: credential-layer diagnostics for the e2e
+                        # 403-after-refresh face (env-guarded, off in prod).
+                        export SHIZUHA_SERVICE_ACCESS_DIAG=1
                         # RS256/JWKS verification (PLAT-675): Connect only accepts
                         # ID's RS256 tokens; point the JWKS fetch + issuer check at
                         # the in-pod ID backend (default shizuha-id:8001 does not
