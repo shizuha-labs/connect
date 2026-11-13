@@ -64,6 +64,7 @@ class MeetingSerializer(serializers.ModelSerializer):
     can_join = serializers.ReadOnlyField()
     shareable_link = serializers.SerializerMethodField()
 
+
     class Meta:
         model = Meeting
         fields = [
@@ -152,6 +153,22 @@ class MeetingCreateSerializer(serializers.ModelSerializer):
         default=list
     )
 
+    # CON-527: the natural field names are accepted as write aliases for the
+    # canonical scheduled_start/scheduled_end. Without these, a client (or UI
+    # form) posting start_time/end_time got 201-with-silent-drop — the meeting
+    # minted status=scheduled with no schedule (WIKI-138 class).
+    start_time = serializers.DateTimeField(
+        source='scheduled_start', write_only=True, required=False, allow_null=True,
+    )
+    end_time = serializers.DateTimeField(
+        source='scheduled_end', write_only=True, required=False, allow_null=True,
+    )
+
+    _ALIAS_SOURCES = {
+        'start_time': 'scheduled_start',
+        'end_time': 'scheduled_end',
+    }
+
     class Meta:
         model = Meeting
         fields = [
@@ -159,6 +176,9 @@ class MeetingCreateSerializer(serializers.ModelSerializer):
             'description',
             'scheduled_start',
             'scheduled_end',
+            # CON-527 write aliases (declared above; write-only)
+            'start_time',
+            'end_time',
             'waiting_room_enabled',
             'recording_enabled',
             'chat_enabled',
@@ -166,6 +186,26 @@ class MeetingCreateSerializer(serializers.ModelSerializer):
             'max_participants',
             'invite_emails',
         ]
+
+    def to_internal_value(self, data):
+        # CON-527 / WIKI-138 class: fail closed on unknown create fields
+        # instead of silently dropping them. Anything the serializer does not
+        # declare is a contract error and must 400, not vanish.
+        if hasattr(data, 'keys'):
+            declared = set(self.fields)
+            unknown = sorted(k for k in data if isinstance(k, str) and k not in declared)
+            if unknown:
+                raise serializers.ValidationError(
+                    {k: ['Unknown field.'] for k in unknown}
+                )
+            # A client sending both the alias and the canonical name for the
+            # same value is ambiguous — reject instead of order-dependent wins.
+            for alias, canonical in self._ALIAS_SOURCES.items():
+                if alias in data and canonical in data:
+                    raise serializers.ValidationError(
+                        {alias: [f"Provide either '{alias}' or '{canonical}', not both."]}
+                    )
+        return super().to_internal_value(data)
 
     def create(self, validated_data):
         # Remove invite_emails before creating meeting
