@@ -226,6 +226,76 @@ class MeetingAPITest(APITestCase):
         self.assertEqual(response.data['title'], 'Team Standup')
         self.assertIn('meeting_code', response.data)
 
+    def test_create_meeting_accepts_natural_time_aliases(self):
+        """CON-527: start_time/end_time are accepted aliases for the canonical
+        scheduled_start/scheduled_end — no 201-with-silent-drop."""
+        self.client.force_authenticate(user=self.host)
+
+        data = {
+            'title': 'Aliased Meeting',
+            'start_time': '2026-11-08T07:54:08Z',
+            'end_time': '2026-11-08T08:54:08Z',
+        }
+
+        response = self.client.post('/api/meetings/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        # Compare instants: the API renders in the server timezone.
+        from django.utils.dateparse import parse_datetime
+        self.assertEqual(
+            parse_datetime(response.data['scheduled_start']),
+            parse_datetime('2026-11-08T07:54:08Z'),
+        )
+        self.assertEqual(
+            parse_datetime(response.data['scheduled_end']),
+            parse_datetime('2026-11-08T08:54:08Z'),
+        )
+        self.assertEqual(response.data['status'], 'scheduled')
+
+    def test_create_meeting_canonical_names_still_accepted(self):
+        """CON-527: scheduled_start/scheduled_end keep working."""
+        self.client.force_authenticate(user=self.host)
+
+        data = {
+            'title': 'Canonical Meeting',
+            'scheduled_start': '2026-11-08T07:54:08Z',
+            'scheduled_end': '2026-11-08T08:54:08Z',
+        }
+
+        response = self.client.post('/api/meetings/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertIsNotNone(response.data['scheduled_start'])
+        self.assertIsNotNone(response.data['scheduled_end'])
+
+    def test_create_meeting_rejects_alias_and_canonical_together(self):
+        """CON-527: providing both the alias and the canonical name is
+        ambiguous — typed 400, not order-dependent wins."""
+        self.client.force_authenticate(user=self.host)
+
+        data = {
+            'title': 'Ambiguous Meeting',
+            'start_time': '2026-11-08T07:54:08Z',
+            'scheduled_start': '2026-11-08T09:00:00Z',
+        }
+
+        response = self.client.post('/api/meetings/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('start_time', response.data)
+
+    def test_create_meeting_rejects_unknown_fields(self):
+        """CON-527 / WIKI-138 class: unknown write fields get a typed 400 —
+        never 201-with-silent-drop."""
+        self.client.force_authenticate(user=self.host)
+
+        data = {
+            'title': 'Unknown Field Meeting',
+            'start_time': '2026-11-08T07:54:08Z',
+            'start_at': '2026-11-08T07:54:08Z',  # plausible-but-wrong name
+        }
+
+        response = self.client.post('/api/meetings/', data, format='json')
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn('start_at', response.data)
+
     @patch('connect.services.livekit_service.LiveKitService.create_room_token')
     def test_create_instant_meeting(self, mock_create_token):
         """Test creating an instant meeting."""
